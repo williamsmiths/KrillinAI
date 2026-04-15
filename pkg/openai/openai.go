@@ -15,10 +15,21 @@ import (
 )
 
 func (c *Client) ChatCompletion(query string) (string, error) {
+	return c.chatCompletionWithModel(query, config.Conf.Llm.Model)
+}
+
+func (c *Client) ChatCompletionWithModel(query string, model string) (string, error) {
+	if strings.TrimSpace(model) == "" {
+		model = config.Conf.Llm.Model
+	}
+	return c.chatCompletionWithModel(query, model)
+}
+
+func (c *Client) chatCompletionWithModel(query string, model string) (string, error) {
 	var responseFormat *openai.ChatCompletionResponseFormat
 
 	req := openai.ChatCompletionRequest{
-		Model: config.Conf.Llm.Model,
+		Model: model,
 		Messages: []openai.ChatCompletionMessage{
 			{
 				Role:    openai.ChatMessageRoleSystem,
@@ -37,7 +48,7 @@ func (c *Client) ChatCompletion(query string) (string, error) {
 
 	stream, err := c.client.CreateChatCompletionStream(context.Background(), req)
 	if err != nil {
-		log.GetLogger().Error("openai create chat completion stream failed", zap.Error(err))
+		log.GetLogger().Error("openai create chat completion stream failed", zap.String("model", model), zap.Error(err))
 		return "", err
 	}
 	defer stream.Close()

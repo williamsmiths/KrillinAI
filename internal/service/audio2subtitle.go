@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -26,6 +28,50 @@ import (
 type TranslatedItem struct {
 	OriginText     string
 	TranslatedText string
+}
+
+var llmFallbackModels = []string{
+	"gh/gpt-5-mini",
+	"gh/gpt-4o-mini",
+	"kr/deepseek-3.2",
+	"if/deepseek-v3.2",
+	"if/qwen3-max",
+}
+
+var llmModelRRCounter atomic.Uint64
+var rateLimitedModels sync.Map
+
+const llmRateLimitCooldown = 2 * time.Minute
+
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "429") ||
+		strings.Contains(msg, "rate limit") ||
+		strings.Contains(msg, "too many requests")
+}
+
+func markModelRateLimited(model string) {
+	rateLimitedModels.Store(model, time.Now().Add(llmRateLimitCooldown))
+}
+
+func isModelTemporarilyDisabled(model string) bool {
+	until, ok := rateLimitedModels.Load(model)
+	if !ok {
+		return false
+	}
+	expiresAt, ok := until.(time.Time)
+	if !ok {
+		rateLimitedModels.Delete(model)
+		return false
+	}
+	if time.Now().After(expiresAt) {
+		rateLimitedModels.Delete(model)
+		return false
+	}
+	return true
 }
 
 func (s Service) audioToSubtitle(ctx context.Context, stepParam *types.SubtitleTaskStepParam) error {
@@ -122,6 +168,78 @@ func (s Service) IsSplitUseSpace(language types.StandardLanguageCode) bool {
 	return false
 }
 
+func (s Service) buildModelFallbackOrder() []string {
+	seen := make(map[string]struct{})
+	models := make([]string, 0, 1+len(llmFallbackModels))
+
+	appendModel := func(model string) {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			return
+		}
+		if _, ok := seen[model]; ok {
+			return
+		}
+		seen[model] = struct{}{}
+		models = append(models, model)
+	}
+
+	appendModel(config.Conf.Llm.Model)
+	for _, model := range config.Conf.Llm.Models {
+		appendModel(model)
+	}
+	for _, model := range llmFallbackModels {
+		appendModel(model)
+	}
+	return models
+}
+
+func (s Service) buildModelAttemptOrder() []string {
+	models := s.buildModelFallbackOrder()
+	if len(models) <= 1 {
+		return models
+	}
+	start := int(llmModelRRCounter.Add(1)-1) % len(models)
+	if start == 0 {
+		return models
+	}
+	rotated := make([]string, 0, len(models))
+	rotated = append(rotated, models[start:]...)
+	rotated = append(rotated, models[:start]...)
+	return rotated
+}
+
+func (s Service) chatCompletionWithFallback(prompt string) (string, string, error) {
+	var lastErr error
+	for _, model := range s.buildModelAttemptOrder() {
+		if isModelTemporarilyDisabled(model) {
+			log.GetLogger().Warn("skip rate-limited model in cooldown", zap.String("model", model))
+			continue
+		}
+		translatedText, err := s.ChatCompleter.ChatCompletionWithModel(prompt, model)
+		if err == nil {
+			translatedText = strings.TrimSpace(translatedText)
+			if translatedText == "" {
+				lastErr = errors.New("empty_response")
+				log.GetLogger().Warn("llm translate empty response, try next model", zap.String("model", model))
+				continue
+			}
+			return translatedText, model, nil
+		}
+		lastErr = err
+		if isRateLimitError(err) {
+			markModelRateLimited(model)
+			log.GetLogger().Warn("model hit rate limit, put into cooldown", zap.String("model", model), zap.Duration("cooldown", llmRateLimitCooldown), zap.Error(err))
+			continue
+		}
+		log.GetLogger().Warn("llm translate failed, try fallback model", zap.String("model", model), zap.Error(err))
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no available fallback model")
+	}
+	return "", "", lastErr
+}
+
 func (s Service) splitTextAndTranslateV2(basePath, inputText string, originLang, targetLang types.StandardLanguageCode, enableModalFilter bool, id int) ([]*TranslatedItem, error) {
 	sentences := util.SplitTextSentences(inputText, config.Conf.App.MaxSentenceLength)
 	if len(sentences) == 0 {
@@ -207,7 +325,7 @@ func (s Service) splitTextAndTranslateV2(basePath, inputText string, originLang,
 
 			prompt := fmt.Sprintf(types.SplitTextWithContextPrompt, types.GetStandardLanguageName(targetLang), previousSentences, originText, nextSentences)
 
-			translatedText, err := s.ChatCompleter.ChatCompletion(prompt)
+			translatedText, modelUsed, err := s.chatCompletionWithFallback(prompt)
 			if err != nil {
 				log.GetLogger().Error("splitTextAndTranslateV2 llm translate error", zap.Error(err), zap.Any("original text", originText))
 				results[index] = &TranslatedItem{
@@ -216,6 +334,15 @@ func (s Service) splitTextAndTranslateV2(basePath, inputText string, originLang,
 				}
 			} else {
 				translatedText = strings.TrimSpace(translatedText)
+				if translatedText == "" {
+					log.GetLogger().Warn("splitTextAndTranslateV2 llm translate empty response", zap.String("model", modelUsed), zap.Any("original text", originText))
+					results[index] = &TranslatedItem{
+						OriginText:     originText,
+						TranslatedText: originText,
+					}
+					return
+				}
+				log.GetLogger().Info("splitTextAndTranslateV2 llm translate success", zap.String("model", modelUsed))
 				results[index] = &TranslatedItem{
 					OriginText:     originText,
 					TranslatedText: translatedText,
@@ -358,48 +485,50 @@ func (s Service) audioToSrt(ctx context.Context, stepParam *types.SubtitleTaskSt
 	}
 
 	// 分句+翻译
-	eg.Go(func() error {
-		for {
-			select {
-			case <-ctx.Done():
-				return nil
-			case translateItem, ok := <-pendingTranslationQueue:
-				if !ok {
+	for range config.Conf.App.TranslateParallelNum {
+		eg.Go(func() error {
+			for {
+				select {
+				case <-ctx.Done():
 					return nil
-				}
-				var translatedResults []*TranslatedItem
-				var err error
-				// 翻译文本
-				log.GetLogger().Info("Begin to translate", zap.Any("taskId", stepParam.TaskId), zap.Any("splitId", translateItem.Id))
-				for range config.Conf.App.TranslateMaxAttempts {
-					translatedResults, err = s.splitTextAndTranslateV2(stepParam.TaskBasePath, translateItem.Data, stepParam.OriginLanguage, stepParam.TargetLanguage, stepParam.EnableModalFilter, translateItem.Id)
-					if err == nil {
-						break
+				case translateItem, ok := <-pendingTranslationQueue:
+					if !ok {
+						return nil
 					}
-				}
-				if err != nil {
-					return fmt.Errorf("audioToSubtitle audioToSrt splitTextAndTranslate err: %w", err)
-				}
-				_ = util.SaveToDisk(translatedResults, filepath.Join(stepParam.TaskBasePath, fmt.Sprintf(types.SubtitleTaskTranslationDataPersistenceFileNamePattern, translateItem.Id)))
-				log.GetLogger().Info("Translate completed", zap.Any("taskId", stepParam.TaskId), zap.Any("splitId", translateItem.Id))
-				// 二次分割长句
-				splitResults, err := s.splitTranslateItem(translatedResults)
-				if err != nil {
-					// 不中断
-					log.GetLogger().Error("audioToSubtitle audioToSrt splitTranslateItem err", zap.Any("taskId", stepParam.TaskId), zap.Any("splitId", translateItem.Id), zap.Error(err))
-					translatedQueue <- DataWithId[[]*TranslatedItem]{
-						Data: translatedResults,
-						Id:   translateItem.Id,
+					var translatedResults []*TranslatedItem
+					var err error
+					// 翻译文本
+					log.GetLogger().Info("Begin to translate", zap.Any("taskId", stepParam.TaskId), zap.Any("splitId", translateItem.Id))
+					for range config.Conf.App.TranslateMaxAttempts {
+						translatedResults, err = s.splitTextAndTranslateV2(stepParam.TaskBasePath, translateItem.Data, stepParam.OriginLanguage, stepParam.TargetLanguage, stepParam.EnableModalFilter, translateItem.Id)
+						if err == nil {
+							break
+						}
 					}
-				} else {
-					translatedQueue <- DataWithId[[]*TranslatedItem]{
-						Data: splitResults,
-						Id:   translateItem.Id,
+					if err != nil {
+						return fmt.Errorf("audioToSubtitle audioToSrt splitTextAndTranslate err: %w", err)
+					}
+					_ = util.SaveToDisk(translatedResults, filepath.Join(stepParam.TaskBasePath, fmt.Sprintf(types.SubtitleTaskTranslationDataPersistenceFileNamePattern, translateItem.Id)))
+					log.GetLogger().Info("Translate completed", zap.Any("taskId", stepParam.TaskId), zap.Any("splitId", translateItem.Id))
+					// 二次分割长句
+					splitResults, err := s.splitTranslateItem(translatedResults)
+					if err != nil {
+						// 不中断
+						log.GetLogger().Error("audioToSubtitle audioToSrt splitTranslateItem err", zap.Any("taskId", stepParam.TaskId), zap.Any("splitId", translateItem.Id), zap.Error(err))
+						translatedQueue <- DataWithId[[]*TranslatedItem]{
+							Data: translatedResults,
+							Id:   translateItem.Id,
+						}
+					} else {
+						translatedQueue <- DataWithId[[]*TranslatedItem]{
+							Data: splitResults,
+							Id:   translateItem.Id,
+						}
 					}
 				}
 			}
-		}
-	})
+		})
+	}
 
 	// 处理结果，更新字幕任务信息
 	eg.Go(func() error {
@@ -1256,8 +1385,9 @@ func (s Service) splitTranslateItem(items []*TranslatedItem) ([]*TranslatedItem,
 		log.GetLogger().Info("splitTranslateItem long sentence detected, need split", zap.Any("item", item))
 		splitItems, err := s.splitLongSentence(item)
 		if err != nil {
-			log.GetLogger().Error("splitTranslateItem splitLongSentence error", zap.Error(err), zap.Any("item", item))
-			return nil, fmt.Errorf("split long sentence error: %w", err)
+			log.GetLogger().Warn("splitTranslateItem splitLongSentence error, use original translated text", zap.Error(err), zap.Any("item", item))
+			result = append(result, item)
+			continue
 		}
 		result = append(result, splitItems...)
 	}
@@ -1269,10 +1399,11 @@ func (s Service) splitTranslateItem(items []*TranslatedItem) ([]*TranslatedItem,
 func (s Service) splitLongSentence(item *TranslatedItem) ([]*TranslatedItem, error) {
 	prompt := fmt.Sprintf(types.SplitLongSentencePrompt, item.OriginText, item.TranslatedText)
 
-	response, err := s.ChatCompleter.ChatCompletion(prompt)
+	response, modelUsed, err := s.chatCompletionWithFallback(prompt)
 	if err != nil {
 		return nil, fmt.Errorf("chat completion error: %w", err)
 	}
+	log.GetLogger().Info("splitLongSentence llm success", zap.String("model", modelUsed))
 
 	var splitResult struct {
 		Align []struct {
@@ -1293,6 +1424,9 @@ func (s Service) splitLongSentence(item *TranslatedItem) ([]*TranslatedItem, err
 			TranslatedText: part.TranslatedPart,
 		})
 	}
+	if len(splitItems) == 0 {
+		return nil, fmt.Errorf("split result empty")
+	}
 
 	return splitItems, nil
 }
@@ -1308,11 +1442,13 @@ func (s Service) splitOriginLongSentence(sentence string) ([]string, error) {
 	shortSentences := make([]string, 0)
 	// 尝试调用3次
 	for i := range 3 {
-		response, err = s.ChatCompleter.ChatCompletion(prompt)
+		var modelUsed string
+		response, modelUsed, err = s.chatCompletionWithFallback(prompt)
 		if err != nil {
 			log.GetLogger().Error("splitOriginLongSentence chat completion error", zap.Error(err), zap.String("sentence", sentence), zap.Any("time", i))
 			continue
 		}
+		log.GetLogger().Info("splitOriginLongSentence llm success", zap.String("model", modelUsed))
 		var splitResult struct {
 			ShortSentences []struct {
 				Text string `json:"text"`

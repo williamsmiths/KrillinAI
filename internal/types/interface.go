@@ -2,6 +2,7 @@ package types
 
 type ChatCompleter interface {
 	ChatCompletion(query string) (string, error)
+	ChatCompletionWithModel(query string, model string) (string, error)
 }
 
 type Transcriber interface {

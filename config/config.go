@@ -35,6 +35,7 @@ type OpenaiCompatibleConfig struct {
 	BaseUrl string `toml:"base_url"`
 	ApiKey  string `toml:"api_key"`
 	Model   string `toml:"model"`
+	Models  []string `toml:"models"`
 }
 
 type LocalModelConfig struct {

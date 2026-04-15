@@ -31,6 +31,7 @@ type ConfigRequest struct {
 		BaseUrl string `json:"baseUrl"`
 		ApiKey  string `json:"apiKey"`
 		Model   string `json:"model"`
+		Models  []string `json:"models"`
 	} `json:"llm"`
 	Transcribe struct {
 		Provider              string `json:"provider"`
@@ -118,10 +119,12 @@ func (h Handler) GetConfig(c *gin.Context) {
 			BaseUrl string `json:"baseUrl"`
 			ApiKey  string `json:"apiKey"`
 			Model   string `json:"model"`
+			Models  []string `json:"models"`
 		}{
 			BaseUrl: config.Conf.Llm.BaseUrl,
 			ApiKey:  config.Conf.Llm.ApiKey,
 			Model:   config.Conf.Llm.Model,
+			Models:  config.Conf.Llm.Models,
 		},
 	}
 
@@ -198,6 +201,7 @@ func (h Handler) UpdateConfig(c *gin.Context) {
 	config.Conf.Llm.BaseUrl = req.Llm.BaseUrl
 	config.Conf.Llm.ApiKey = req.Llm.ApiKey
 	config.Conf.Llm.Model = req.Llm.Model
+	config.Conf.Llm.Models = req.Llm.Models
 
 	// 更新转录配置
 	config.Conf.Transcribe.Provider = req.Transcribe.Provider
