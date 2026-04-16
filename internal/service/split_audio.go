@@ -19,6 +19,7 @@ const (
 	TOLERANCE_DURATION     = 8   // 容忍的时间误差
 	MIN_DURATION           = 10  // 最小音频时长
 	MIN_SEGMENT_DURATION   = 20  // 最小分割时长
+	MIN_SPLIT_GAP          = 3   // 分割点之间最小间隔，防止异常重叠
 )
 
 func buildFFmpegCmd(input string, start, end float64) (*exec.Cmd, error) {
@@ -134,6 +135,24 @@ func GetSplitPoints(input string, segmentDuration float64) ([]float64, error) {
 	}
 	if err := eg.Wait(); err != nil {
 		return nil, fmt.Errorf("failed to get quietest time points: %w", err)
+	}
+	// 修正异常分割点：静音搜索在复杂音轨上可能给出非单调结果，
+	// 会导致切片偏移异常，进而出现字幕时间“乱跳”。
+	for i := 1; i < len(timePoints)-1; i++ {
+		// 保障与前一个分割点至少有最小间隔
+		minAllowed := timePoints[i-1] + MIN_SPLIT_GAP
+		// 保障后续仍有足够空间容纳剩余片段（每段至少 MIN_SPLIT_GAP）
+		remainingSegments := float64(len(timePoints)-1-i) * MIN_SPLIT_GAP
+		maxAllowed := audioDuration - remainingSegments
+		if maxAllowed < minAllowed {
+			maxAllowed = minAllowed
+		}
+		if timePoints[i] < minAllowed {
+			timePoints[i] = minAllowed
+		}
+		if timePoints[i] > maxAllowed {
+			timePoints[i] = maxAllowed
+		}
 	}
 	// 如果最后一个片段短于最小分割时长，则将其合并到前一个片段
 	if audioDuration-timePoints[segmentNum-1] < MIN_DURATION {

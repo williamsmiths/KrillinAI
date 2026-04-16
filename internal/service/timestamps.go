@@ -13,6 +13,14 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	// Keep subtitle blocks readable even when ASR word spans are too tight.
+	minSubtitleDurationSec = 0.55
+	// If a very short sentence suddenly jumps too far from the previous block,
+	// treat it as suspicious alignment and fall back to sequential timing.
+	suspiciousGapSec = 8.0
+)
+
 // TimestampMatcher defines the interface for different language timestamp matching algorithms
 type TimestampMatcher interface {
 	// MatchSentenceTimestamp finds the start and end timestamps for a sentence
@@ -82,15 +90,29 @@ func (tg *TimestampGenerator) GenerateTimestamps(srtBlocks []*util.SrtBlock, wor
 				zap.Error(err))
 			// Use fallback timing
 			startTime = lastEndTime
-			endTime = lastEndTime
+			endTime = startTime + minSubtitleDurationSec
 		} else {
 			// Ensure timestamps don't overlap with previous block
 			if startTime < lastEndTime {
 				startTime = lastEndTime
 			}
 			if endTime <= startTime {
-				endTime = startTime + 1.0 // Minimum 1 second duration
+				endTime = startTime + minSubtitleDurationSec
 			}
+			// Guard against occasional far-jump mismatches on short lines.
+			// These are typically caused by repeated tokens in long audio streams.
+			if startTime-lastEndTime > suspiciousGapSec && utf8RuneLen(strings.TrimSpace(block.OriginLanguageSentence)) <= 12 {
+				log.GetLogger().Warn("Suspicious timestamp jump detected, fallback to sequential timing",
+					zap.String("sentence", block.OriginLanguageSentence),
+					zap.Float64("lastEndTime", lastEndTime),
+					zap.Float64("startTime", startTime),
+					zap.Float64("endTime", endTime))
+				startTime = lastEndTime
+				endTime = startTime + minSubtitleDurationSec
+			}
+		}
+		if endTime-startTime < minSubtitleDurationSec {
+			endTime = startTime + minSubtitleDurationSec
 		}
 
 		// Generate timestamp string
@@ -106,6 +128,14 @@ func (tg *TimestampGenerator) GenerateTimestamps(srtBlocks []*util.SrtBlock, wor
 	}
 
 	return updatedBlocks, nil
+}
+
+func utf8RuneLen(s string) int {
+	count := 0
+	for range s {
+		count++
+	}
+	return count
 }
 
 // // AlphabeticLanguageMatcher handles timestamp matching for alphabetic languages (English, French, etc.)
