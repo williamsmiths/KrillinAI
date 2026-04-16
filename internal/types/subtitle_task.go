@@ -124,8 +124,8 @@ var SplitLongSentencePrompt = `请将以下原文和译文分割成多个部分�
 
 要求：
 1. 分割后的原文与原文不能有偏差 
-2. 分割后的每个翻译句都需要符合语法规范，可进行添加连词、去除助词等操作等保证每句读起来都是自然的
-3. 译文如果有遗漏，请在分割的同时补全
+2. 分割后的每个翻译句都需要符合语法规范，但禁止新增剧情、禁止引入无关句子
+3. 严禁补写或扩写，仅允许在原译文范围内重排断句，不得改变事实信息
 4. 务必返回JSON格式，包含origin_part和translated_part数组，例如：
 {"align":[{"origin_part":"原文部分1","translated_part":"译文部分1"},{"origin_part":"原文部分2","translated_part":"译文部分2"}]}`
 
@@ -201,21 +201,113 @@ Requirements:
 
 // Please provide only the translation result:`
 
-var SplitTextWithContextPrompt = `You are a professional subtitle translation expert.
+var SplitTextWithContextPrompt = `You are a professional subtitle localization team for Chinese films and donghua.
 
-[STRICT TRANSLATION TASK]
-**Objective**: 
-Translate ONLY the "Target Sentence" below into %s.
-Use "Previous Sentences" ONLY to understand the context of referents (e.g. pronouns or ellipses), not to infer meaning.
+Your task is to fully process and adapt dialogue into %s subtitles at production quality.
 
-**Critical Rules**:
-1. OUTPUT MUST BE A SINGLE LINE: only the translation of the target sentence
-2. Do NOT infer or explain the meaning of the target sentence. Do NOT add any logical connections or causal phrases
-3. If the sentence is fragmentary or dependent (e.g. starts with "that"), KEEP IT THAT WAY in translation
-4. Do NOT complete or rewrite the sentence for fluency
-5. IGNORE the "Next Sentences" completely
+You must perform multiple internal passes:
+(translation -> rewriting -> subtitle optimization -> character voice -> final polish)
 
-**Context**:
+---
+
+## PASS 1 - MEANING EXTRACTION
+
+For each line:
+
+* Understand the real meaning and intention
+* Identify context: combat, threat, calm, emotional, philosophical
+* Ignore literal wording if necessary
+
+---
+
+## PASS 2 - DIALOGUE REWRITE
+
+Rewrite the line into natural dialogue:
+
+* Clear meaning
+* Natural spoken flow
+* Emotionally accurate
+
+You may:
+
+* Rephrase wording for natural Vietnamese flow
+* Reorder words for readability
+* Keep every spoken meaning unit from the source
+
+---
+
+## PASS 3 - GENRE ADAPTATION
+
+* Detect genre automatically (xianxia, xuanhuan, wuxia, historical, supernatural...)
+* Apply correct terminology:
+  cảnh giới, linh khí, nhục thân, tông môn, công pháp, thiên kiếp...
+* Interpret symbolic words (chaos, blood, void, heaven...) as:
+  cultivation systems, metaphors, or lore
+
+---
+
+## PASS 4 - SUBTITLE TIMING & RHYTHM
+
+Optimize for real subtitle usage:
+
+* Max 1-2 lines per subtitle
+* Each line short and easy to read
+* Break lines at natural speaking pauses
+
+Prefer:
+
+* Punchy, impactful phrasing
+* Spoken rhythm (pauses, emphasis)
+
+---
+
+## PASS 5 - CHARACTER VOICE SYSTEM
+
+Maintain consistent voice per character:
+
+* Arrogant -> sharp, dominant, confident
+* Master -> calm, deep, composed
+* Villain -> cold, oppressive, minimal words
+* Youth -> direct, energetic
+
+---
+
+## PASS 6 - CINEMATIC ENHANCEMENT
+
+Upgrade dialogue to feel like real film:
+
+* Add dramatic pauses if needed
+* Strengthen emotional impact
+* Make lines memorable and natural
+
+---
+
+## PASS 7 - FINAL QUALITY FILTER (CRITICAL)
+
+For every line:
+
+* Does it make immediate sense?
+* Does it sound like real spoken dialogue?
+* Does it match the scene?
+* Does it feel like official subtitles?
+
+If ANY answer is no -> rewrite until it passes.
+
+---
+
+## HARD RULES
+
+* NEVER translate word-by-word
+* NEVER produce meaningless or awkward sentences
+* ALWAYS prioritize clarity, tone, and cinematic quality
+* NEVER omit spoken content (including short reactions/interjections)
+* NEVER merge target line with neighboring lines
+* NEVER invent new facts or dialogue not present in target sentence
+
+---
+
+## CONTEXT
+
 [Previous Sentences]
 %s
 
@@ -225,7 +317,15 @@ Use "Previous Sentences" ONLY to understand the context of referents (e.g. prono
 [Next Sentences]
 %s
 
-**Your output must be literal, minimal, and on a single line. Provide only the translation result:**`
+---
+
+## OUTPUT FORMAT
+
+* %s only
+* Subtitle style (short, broken lines if needed)
+* Natural, cinematic, production-ready
+* No explanation
+* Output ONLY the final subtitle line`
 
 type SmallAudio struct {
 	AudioFile         string

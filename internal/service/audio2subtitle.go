@@ -12,6 +12,7 @@ import (
 	"krillin-ai/pkg/util"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -42,6 +43,7 @@ var llmModelRRCounter atomic.Uint64
 var rateLimitedModels sync.Map
 
 const llmRateLimitCooldown = 2 * time.Minute
+const llmUnsupportedModelCooldown = 30 * time.Minute
 
 func isRateLimitError(err error) bool {
 	if err == nil {
@@ -53,8 +55,18 @@ func isRateLimitError(err error) bool {
 		strings.Contains(msg, "too many requests")
 }
 
-func markModelRateLimited(model string) {
-	rateLimitedModels.Store(model, time.Now().Add(llmRateLimitCooldown))
+func isUnsupportedModelError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "406") ||
+		strings.Contains(msg, "not acceptable") ||
+		strings.Contains(msg, "model not supported")
+}
+
+func markModelCooldown(model string, d time.Duration) {
+	rateLimitedModels.Store(model, time.Now().Add(d))
 }
 
 func isModelTemporarilyDisabled(model string) bool {
@@ -153,8 +165,13 @@ func (s Service) transcribeAudio(id int, audioFilePath string, language string, 
 
 	_ = util.SaveToDisk(transcriptionData, filepath.Join(taskBasePath, fmt.Sprintf(types.SubtitleTaskAudioTranscriptionDataPersistenceFileNamePattern, id)))
 
-	if transcriptionData.Text == "" {
-		log.GetLogger().Info("audioToSubtitle transcribeAudio TranscriptionData.Text is empty", zap.Any("audioFilePath", audioFilePath), zap.Any("taskBasePath", taskBasePath))
+	if strings.TrimSpace(transcriptionData.Text) == "" {
+		log.GetLogger().Warn("audioToSubtitle transcribeAudio TranscriptionData.Text is empty", zap.Any("audioFilePath", audioFilePath), zap.Any("taskBasePath", taskBasePath))
+		return nil, errors.New("ERR_ASR_EMPTY_TEXT")
+	}
+	if len(transcriptionData.Words) == 0 {
+		log.GetLogger().Warn("audioToSubtitle transcribeAudio TranscriptionData.Words is empty", zap.Any("audioFilePath", audioFilePath), zap.Any("taskBasePath", taskBasePath))
+		return nil, errors.New("ERR_ASR_EMPTY_WORDS")
 	}
 	return transcriptionData, nil
 }
@@ -166,6 +183,51 @@ func (s Service) IsSplitUseSpace(language types.StandardLanguageCode) bool {
 	}
 
 	return false
+}
+
+func buildPauseAwareText(words []types.Word, language types.StandardLanguageCode) string {
+	if len(words) == 0 {
+		return ""
+	}
+
+	const (
+		// Segment pauses into explicit sentence boundaries.
+		strongPauseSec = 0.55
+	)
+
+	var builder strings.Builder
+	var prevEnd float64
+	hasPrev := false
+	isCjkStyle := language == types.LanguageNameSimplifiedChinese ||
+		language == types.LanguageNameTraditionalChinese ||
+		language == types.LanguageNameJapanese ||
+		language == types.LanguageNameKorean
+
+	for _, w := range words {
+		token := strings.TrimSpace(w.Text)
+		if token == "" {
+			continue
+		}
+
+		if hasPrev && w.Start > prevEnd {
+			gap := w.Start - prevEnd
+			if gap >= strongPauseSec {
+				if builder.Len() > 0 {
+					builder.WriteString("。")
+				}
+			} else if builder.Len() > 0 && !isCjkStyle {
+				builder.WriteString(" ")
+			}
+		} else if builder.Len() > 0 && !isCjkStyle {
+			builder.WriteString(" ")
+		}
+
+		builder.WriteString(token)
+		prevEnd = w.End
+		hasPrev = true
+	}
+
+	return strings.TrimSpace(builder.String())
 }
 
 func (s Service) buildModelFallbackOrder() []string {
@@ -228,8 +290,13 @@ func (s Service) chatCompletionWithFallback(prompt string) (string, string, erro
 		}
 		lastErr = err
 		if isRateLimitError(err) {
-			markModelRateLimited(model)
+			markModelCooldown(model, llmRateLimitCooldown)
 			log.GetLogger().Warn("model hit rate limit, put into cooldown", zap.String("model", model), zap.Duration("cooldown", llmRateLimitCooldown), zap.Error(err))
+			continue
+		}
+		if isUnsupportedModelError(err) {
+			markModelCooldown(model, llmUnsupportedModelCooldown)
+			log.GetLogger().Warn("model not supported, skip with cooldown", zap.String("model", model), zap.Duration("cooldown", llmUnsupportedModelCooldown), zap.Error(err))
 			continue
 		}
 		log.GetLogger().Warn("llm translate failed, try fallback model", zap.String("model", model), zap.Error(err))
@@ -323,7 +390,14 @@ func (s Service) splitTextAndTranslateV2(basePath, inputText string, originLang,
 				}
 			}
 
-			prompt := fmt.Sprintf(types.SplitTextWithContextPrompt, types.GetStandardLanguageName(targetLang), previousSentences, originText, nextSentences)
+			prompt := fmt.Sprintf(
+				types.SplitTextWithContextPrompt,
+				types.GetStandardLanguageName(targetLang),
+				previousSentences,
+				originText,
+				nextSentences,
+				types.GetStandardLanguageName(targetLang),
+			)
 
 			translatedText, modelUsed, err := s.chatCompletionWithFallback(prompt)
 			if err != nil {
@@ -564,9 +638,13 @@ func (s Service) audioToSrt(ctx context.Context, stepParam *types.SubtitleTaskSt
 				stepParam.TaskPtr.ProcessPct = uint8(processPct)
 				// 处理转录结果
 				audioSegments[transcribedItem.Id].TranscriptionData = transcribedItem.Data
+				pauseAwareText := buildPauseAwareText(transcribedItem.Data.Words, stepParam.OriginLanguage)
+				if strings.TrimSpace(pauseAwareText) == "" {
+					pauseAwareText = transcribedItem.Data.Text
+				}
 				// 发送翻译任务
 				pendingTranslationQueue <- DataWithId[string]{
-					Data: transcribedItem.Data.Text,
+					Data: pauseAwareText,
 					Id:   transcribedItem.Id,
 				}
 			case translatedItems := <-translatedQueue:
@@ -1372,7 +1450,14 @@ func calcLength(text string) float64 {
 // splitTranslateItem 根据字符权重和最大长度分割长句
 func (s Service) splitTranslateItem(items []*TranslatedItem) ([]*TranslatedItem, error) {
 	var result []*TranslatedItem
-	maxLength := config.Conf.App.MaxSentenceLength + 30
+	maxLength := config.Conf.App.MaxSentenceLength
+	// Keep subtitle lines compact for better rhythm with real speech pauses.
+	if maxLength <= 0 {
+		maxLength = 42
+	}
+	if maxLength > 42 {
+		maxLength = 42
+	}
 
 	for _, item := range items {
 		// 计算翻译文本的加权长度
@@ -1411,24 +1496,68 @@ func (s Service) splitLongSentence(item *TranslatedItem) ([]*TranslatedItem, err
 			TranslatedPart string `json:"translated_part"`
 		} `json:"align"`
 	}
-	if err := json.Unmarshal([]byte(util.CleanMarkdownCodeBlock(response)), &splitResult); err != nil {
+	jsonPayload := extractSplitAlignJSON(response)
+	if err := json.Unmarshal([]byte(jsonPayload), &splitResult); err != nil {
 		log.GetLogger().Error("splitLongSentence parse split result error", zap.Error(err), zap.Any("response", response))
 		return nil, fmt.Errorf("parse split result error: %w", err)
 	}
 
 	// 转换为TranslatedItem切片
 	var splitItems []*TranslatedItem
+	originSum := 0
+	translatedSum := 0
 	for _, part := range splitResult.Align {
+		originPart := strings.TrimSpace(part.OriginPart)
+		translatedPart := strings.TrimSpace(part.TranslatedPart)
+		if originPart == "" || translatedPart == "" {
+			continue
+		}
+		originSum += len(originPart)
+		translatedSum += len(translatedPart)
 		splitItems = append(splitItems, &TranslatedItem{
-			OriginText:     part.OriginPart,
-			TranslatedText: part.TranslatedPart,
+			OriginText:     originPart,
+			TranslatedText: translatedPart,
 		})
 	}
 	if len(splitItems) == 0 {
 		return nil, fmt.Errorf("split result empty")
 	}
+	// 防止模型在拆句阶段胡乱扩写，导致内容漂移严重
+	originLen := len(strings.TrimSpace(item.OriginText))
+	translatedLen := len(strings.TrimSpace(item.TranslatedText))
+	if originLen > 0 {
+		if originSum < originLen/2 || originSum > originLen*2 {
+			return nil, fmt.Errorf("split result origin drift too large")
+		}
+	}
+	if translatedLen > 0 {
+		if translatedSum < translatedLen/2 || translatedSum > translatedLen*3 {
+			return nil, fmt.Errorf("split result translated drift too large")
+		}
+	}
 
 	return splitItems, nil
+}
+
+func extractSplitAlignJSON(response string) string {
+	cleaned := util.CleanMarkdownCodeBlock(response)
+	if strings.TrimSpace(cleaned) == "" {
+		return cleaned
+	}
+
+	// Fast path: response itself is pure JSON.
+	if strings.HasPrefix(strings.TrimSpace(cleaned), "{") && strings.HasSuffix(strings.TrimSpace(cleaned), "}") {
+		return strings.TrimSpace(cleaned)
+	}
+
+	// Common model behavior: return explanation + one JSON object.
+	alignObjectPattern := regexp.MustCompile(`(?s)\{[^{}]*"align"\s*:\s*\[.*?\][^{}]*\}`)
+	if matched := alignObjectPattern.FindString(cleaned); strings.TrimSpace(matched) != "" {
+		return strings.TrimSpace(matched)
+	}
+
+	// Fallback: keep old behavior.
+	return strings.TrimSpace(cleaned)
 }
 
 func (s Service) splitOriginLongSentence(sentence string) ([]string, error) {

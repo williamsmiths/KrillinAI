@@ -95,9 +95,8 @@ func (tg *TimestampGenerator) GenerateTimestamps(srtBlocks []*util.SrtBlock, wor
 
 		// Generate timestamp string
 		updatedBlocks[i].Timestamp = util.ConvertTimes(float32(startTime+tsOffset), float32(endTime+tsOffset))
-		if endTime-startTime < 5 {
-			lastEndTime = endTime
-		}
+		// Always advance the watermark to keep later lines aligned in chronological order.
+		lastEndTime = endTime
 
 		log.GetLogger().Debug("Generated timestamp for sentence",
 			zap.Int("index", block.Index),
@@ -365,20 +364,26 @@ func (jlm *BaseLanguageMatcher) matchSentenceByStringAlignment(sentence string, 
 	}
 
 	// 步骤4: 对每个可能的匹配位置，尝试计算时间戳
+	// Choose the valid match closest to lastTs to reduce late/shifted subtitles when
+	// the same phrase appears multiple times in one segment.
 	var bestStartTime, bestEndTime float64
 	var bestErr error
 	found := false
+	bestDelta := -1.0
 
 	for _, startCharIndex := range allMatches {
 		endCharIndex := startCharIndex + len([]rune(cleanSentence))
 
 		startTime, endTime, err := jlm.calculateTimestampsByCharIndex(startCharIndex, endCharIndex, words, lastTs)
 		if err == nil && startTime >= lastTs {
-			// 找到一个有效的匹配，使用它
-			bestStartTime = startTime
-			bestEndTime = endTime
-			found = true
-			break
+			delta := startTime - lastTs
+			if !found || bestDelta < 0 || delta < bestDelta {
+				bestStartTime = startTime
+				bestEndTime = endTime
+				bestErr = nil
+				found = true
+				bestDelta = delta
+			}
 		} else if err == nil {
 			// 记录这个匹配，但继续寻找更好的
 			if !found || startTime > bestStartTime {
